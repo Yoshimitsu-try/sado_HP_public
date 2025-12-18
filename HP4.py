@@ -16,7 +16,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# 管理者アカウント (緊急用・シート管理用としてコードに残します)
+# 管理者アカウント
 ADMIN_CREDENTIALS = {"id": "admin", "password": "admin", "name": "管理者 (先生)", "role": "admin"}
 
 # --- Google Sheets 接続関数 ---
@@ -37,15 +37,24 @@ def get_db_connection():
 # ==========================================
 
 def load_data():
-    """スケジュールと予約データを読み込む"""
+    """スケジュールと予約データを読み込む（安全対策版）"""
     try:
         wb = get_db_connection()
         ws_sched = wb.worksheet("schedule")
         ws_book = wb.worksheet("bookings")
         
         # 全データ取得
-        df_sched = pd.DataFrame(ws_sched.get_all_records())
-        df_book = pd.DataFrame(ws_book.get_all_records())
+        data_sched = ws_sched.get_all_records()
+        data_book = ws_book.get_all_records()
+        
+        df_sched = pd.DataFrame(data_sched)
+        df_book = pd.DataFrame(data_book)
+        
+        # ★重要: カラム名の空白除去（エラー防止）
+        if not df_sched.empty:
+            df_sched.columns = [str(c).strip() for c in df_sched.columns]
+        if not df_book.empty:
+            df_book.columns = [str(c).strip() for c in df_book.columns]
 
     except Exception as e:
         st.error(f"データ読み込みエラー: {e}")
@@ -53,6 +62,11 @@ def load_data():
 
     appointments = []
     if not df_sched.empty:
+        # 必須カラムチェック
+        if 'date' not in df_sched.columns or 'time' not in df_sched.columns or 'id' not in df_sched.columns:
+            st.error("エラー: scheduleシートの見出しが正しくありません (id, date, time が必要)")
+            return []
+
         # 日付・時間順にソート
         df_sched['date'] = df_sched['date'].astype(str)
         df_sched = df_sched.sort_values(by=["date", "time"])
@@ -62,37 +76,39 @@ def load_data():
             appt['id'] = int(appt['id'])
             
             members = []
+            # 予約データの紐づけ
             if not df_book.empty and 'appointment_id' in df_book.columns:
                 matched = df_book[df_book['appointment_id'].astype(str) == str(appt['id'])]
-                members = matched['user_name'].tolist()
+                if 'user_name' in matched.columns:
+                    members = matched['user_name'].tolist()
             
             appt['members'] = members
             appointments.append(appt)
             
     return appointments
 
-# --- ユーザー認証 & プロフィール管理 (New!) ---
+# --- ユーザー認証 ---
 
 def authenticate_user(user_id, password):
-    """usersシートと照合してログイン"""
-    # 1. 管理者チェック
     if user_id == ADMIN_CREDENTIALS["id"] and password == ADMIN_CREDENTIALS["password"]:
         return {"user_id": "admin", "name": ADMIN_CREDENTIALS["name"], "is_admin": True}
 
-    # 2. 一般ユーザーチェック
     try:
         wb = get_db_connection()
         ws_users = wb.worksheet("users")
         records = ws_users.get_all_records()
         
-        # IDを文字列として比較
         for user in records:
-            if str(user['user_id']) == str(user_id) and str(user['password']) == str(password):
+            # 辞書のキーの空白も削除してアクセス
+            u_data = {k.strip(): v for k, v in user.items()}
+            
+            # 文字列として比較
+            if str(u_data.get('user_id', '')) == str(user_id) and str(u_data.get('password', '')) == str(password):
                 return {
-                    "user_id": str(user['user_id']),
-                    "name": user['name'],
-                    "email": user['email'],
-                    "password": str(user['password']),
+                    "user_id": str(u_data.get('user_id')),
+                    "name": u_data.get('name'),
+                    "email": u_data.get('email', ''),
+                    "password": str(u_data.get('password')),
                     "is_admin": False
                 }
     except Exception as e:
@@ -101,25 +117,16 @@ def authenticate_user(user_id, password):
     return None
 
 def update_user_profile(user_id, new_email, new_password=None):
-    """ユーザー情報を更新する (スプレッドシート書き込み)"""
     try:
         wb = get_db_connection()
         ws_users = wb.worksheet("users")
-        
-        # user_id があるセルを検索 (A列=1列目にあると仮定)
         cell = ws_users.find(str(user_id), in_column=1)
         
         if cell:
             row_num = cell.row
-            # 列の位置: 1:user_id, 2:password, 3:name, 4:email
-            
-            # Emailを更新 (D列=4)
-            ws_users.update_cell(row_num, 4, new_email)
-            
-            # パスワードは入力がある場合のみ更新 (B列=2)
+            ws_users.update_cell(row_num, 4, new_email) # Email column
             if new_password and len(new_password) > 0:
-                ws_users.update_cell(row_num, 2, new_password)
-                
+                ws_users.update_cell(row_num, 2, new_password) # Password column
             return True, "情報を更新しました"
         else:
             return False, "ユーザーが見つかりません"
@@ -129,52 +136,61 @@ def update_user_profile(user_id, new_email, new_password=None):
 # --- 予約ロジック ---
 
 def add_booking(appt_id, user_name):
-    """予約追加"""
     try:
         wb = get_db_connection()
         ws_book = wb.worksheet("bookings")
         ws_sched = wb.worksheet("schedule")
         
+        # 最新データを取得
         df_book = pd.DataFrame(ws_book.get_all_records())
         df_sched = pd.DataFrame(ws_sched.get_all_records())
+        
+        # カラム掃除
+        if not df_book.empty: df_book.columns = [str(c).strip() for c in df_book.columns]
+        if not df_sched.empty: df_sched.columns = [str(c).strip() for c in df_sched.columns]
+        
         appt_id_str = str(appt_id)
 
-        # 重複チェック
-        if not df_book.empty:
+        # 1. 重複チェック
+        if not df_book.empty and 'appointment_id' in df_book.columns:
             exists = ((df_book['appointment_id'].astype(str) == appt_id_str) & 
                       (df_book['user_name'] == user_name)).any()
             if exists: return False, "既に予約済みです"
         
-        # 定員チェック
+        # 2. 定員チェック
+        if 'id' not in df_sched.columns: return False, "scheduleシートにid列がありません"
         target = df_sched[df_sched['id'].astype(str) == appt_id_str]
+        
         if target.empty: return False, "予約枠が見つかりません"
         
         capacity = int(target.iloc[0]['capacity'])
         current_count = 0
-        if not df_book.empty:
+        if not df_book.empty and 'appointment_id' in df_book.columns:
             current_count = len(df_book[df_book['appointment_id'].astype(str) == appt_id_str])
             
         if current_count >= capacity: return False, "満席です"
 
-        # 書き込み
-        new_row = [int(appt_id), user_name, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")]
-        ws_book.append_row(new_row)
+        # 3. 書き込み
+        now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ws_book.append_row([int(appt_id), user_name, now_ts])
+        
         return True, "予約しました"
     except Exception as e:
-        return False, f"エラー: {e}"
+        return False, f"システムエラー: {e}"
 
 def remove_booking(appt_id, user_name):
-    """予約キャンセル"""
     try:
         wb = get_db_connection()
         ws_book = wb.worksheet("bookings")
         records = ws_book.get_all_records()
         row_to_delete = None
         
+        # 行特定ロジック
         for i, r in enumerate(records):
-            # 行番号 = i + 2 (ヘッダー分)
-            if str(r['appointment_id']) == str(appt_id) and r['user_name'] == user_name:
-                row_to_delete = i + 2
+            # キーの空白除去
+            r_clean = {k.strip(): v for k, v in r.items()}
+            if str(r_clean.get('appointment_id')) == str(appt_id) and r_clean.get('user_name') == user_name:
+                row_to_delete = i + 2 # ヘッダー分+1, 0始まり+1
                 break
         
         if row_to_delete:
@@ -194,8 +210,13 @@ def admin_create_slot(date_obj, time_obj, capacity, comment):
         records = ws_sched.get_all_records()
         new_id = 1
         if records:
-            ids = [int(r['id']) for r in records if str(r['id']).isdigit()]
+            ids = []
+            for r in records:
+                # キーのゆらぎに対応
+                val = r.get('id') or r.get('id ')
+                if str(val).isdigit(): ids.append(int(val))
             if ids: new_id = max(ids) + 1
+            
         ws_sched.append_row([new_id, date_obj.strftime("%Y-%m-%d"), time_obj.strftime("%H:%M"), capacity, comment])
         return True, "作成しました"
     except Exception as e: return False, str(e)
@@ -257,7 +278,6 @@ if not st.session_state.logged_in:
                 upw = st.text_input("パスワード", type="password")
                 
                 if st.form_submit_button("ログイン", type="primary", use_container_width=True):
-                    # ユーザー認証
                     user = authenticate_user(uid, upw)
                     if user:
                         st.session_state.logged_in = True
@@ -267,12 +287,10 @@ if not st.session_state.logged_in:
                         st.rerun()
                     else:
                         st.error("IDまたはパスワードが違います")
-            
             st.caption("※ 初めての方は先生よりIDを受け取ってください")
 
 # --- 🅱️ ログイン後 ---
 else:
-    # データをロード
     appointments_data = load_data()
     user_info = st.session_state.user_info
     is_admin = st.session_state.is_admin
@@ -333,14 +351,25 @@ else:
                                 
                                 if is_admin:
                                     if st.button("枠削除", key=f"d_{app['id']}", type="secondary"):
-                                        admin_delete_slot(app['id']); st.rerun()
+                                        success, msg = admin_delete_slot(app['id'])
+                                        if success: st.success(msg); time.sleep(1); st.rerun()
+                                        else: st.error(msg)
                                 else:
                                     if is_mine:
                                         if st.button("キャンセル", key=f"c_{app['id']}"):
-                                            remove_booking(app['id'], user_info['name']); st.rerun()
+                                            success, msg = remove_booking(app['id'], user_info['name'])
+                                            if success: st.success(msg); time.sleep(1); st.rerun()
+                                            else: st.error(msg)
                                     elif not is_full:
+                                        # ★ ここが修正ポイント：成功した時だけリロード
                                         if st.button("予約する", key=f"r_{app['id']}", type="primary"):
-                                            add_booking(app['id'], user_info['name']); st.rerun()
+                                            success, msg = add_booking(app['id'], user_info['name'])
+                                            if success:
+                                                st.success(msg)
+                                                time.sleep(1) # メッセージを見せるため待機
+                                                st.rerun()
+                                            else:
+                                                st.error(msg) # エラーならリロードせず表示
                                     else:
                                         st.error("満席")
 
@@ -361,19 +390,25 @@ else:
                 with c3:
                     if is_admin:
                         if st.button("削除", key=f"lst_d_{app['id']}", use_container_width=True):
-                             admin_delete_slot(app['id']); st.rerun()
+                             success, msg = admin_delete_slot(app['id'])
+                             if success: st.success(msg); time.sleep(1); st.rerun()
+                             else: st.error(msg)
                     else:
                         is_mine = user_info['name'] in app['members']
                         if is_mine:
                             if st.button("取消", key=f"lst_c_{app['id']}", use_container_width=True):
-                                remove_booking(app['id'], user_info['name']); st.rerun()
+                                success, msg = remove_booking(app['id'], user_info['name'])
+                                if success: st.success(msg); time.sleep(1); st.rerun()
+                                else: st.error(msg)
                         elif len(app['members']) < app['capacity']:
                             if st.button("予約", key=f"lst_r_{app['id']}", type="primary"):
-                                add_booking(app['id'], user_info['name']); st.rerun()
+                                success, msg = add_booking(app['id'], user_info['name'])
+                                if success: st.success(msg); time.sleep(1); st.rerun()
+                                else: st.error(msg)
                         else:
                             st.button("満席", disabled=True)
 
-    # === Tab 3: 登録情報 (編集機能付き) ===
+    # === Tab 3: 登録情報 ===
     with tabs[2]:
         st.subheader("会員情報の変更")
         if is_admin:
@@ -382,31 +417,17 @@ else:
         else:
             with st.form("profile_edit"):
                 st.caption(f"会員ID: {user_info['user_id']} (変更不可)")
-                
-                # お名前 (整合性のため変更不可)
-                st.text_input("お名前 (変更不可)", value=user_info['name'], disabled=True, 
-                              help="お名前を変更すると予約履歴が見られなくなるため、変更が必要な場合は先生へご連絡ください。")
-                
+                st.text_input("お名前 (変更不可)", value=user_info['name'], disabled=True)
                 new_email = st.text_input("メールアドレス", value=user_info.get('email', ''))
-                
-                # パスワードは空欄にしておき、入力があった場合のみ更新する
                 new_pw = st.text_input("新しいパスワード (変更する場合のみ入力)", type="password")
                 
                 if st.form_submit_button("情報を更新する", type="primary"):
-                    success, msg = update_user_profile(
-                        user_info['user_id'],
-                        new_email,
-                        new_pw if new_pw else None
-                    )
-                    
+                    success, msg = update_user_profile(user_info['user_id'], new_email, new_pw if new_pw else None)
                     if success:
                         st.success(msg)
-                        # セッション情報を更新して即反映
                         st.session_state.user_info['email'] = new_email
-                        if new_pw:
-                            st.session_state.user_info['password'] = new_pw
-                        time.sleep(1)
-                        st.rerun()
+                        if new_pw: st.session_state.user_info['password'] = new_pw
+                        time.sleep(1); st.rerun()
                     else:
                         st.error(msg)
 
@@ -414,12 +435,38 @@ else:
     if is_admin:
         with tabs[3]:
             st.header("🔧 管理者ダッシュボード")
+            
+            # 診断モード追加
+            st.subheader("🔍 データ状態の確認 (デバッグ)")
+            if st.button("最新データを読み込む"): st.rerun()
+            
+            try:
+                wb = get_db_connection()
+                df_s = pd.DataFrame(wb.worksheet("schedule").get_all_records())
+                df_b = pd.DataFrame(wb.worksheet("bookings").get_all_records())
+                
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write("Schedule Columns:", list(df_s.columns) if not df_s.empty else "Empty")
+                    st.dataframe(df_s.head(3))
+                with c2:
+                    st.write("Bookings Columns:", list(df_b.columns) if not df_b.empty else "Empty")
+                    st.dataframe(df_b.head(3))
+                    if not df_b.empty and 'appointment_id' not in [str(c).strip() for c in df_b.columns]:
+                         st.error("⚠️ bookingsシートに 'appointment_id' 列がありません。列名を確認してください。")
+
+            except Exception as e:
+                st.error(f"データ取得エラー: {e}")
+
+            st.divider()
             with st.form("create_slot"):
                 d = st.date_input("日付", datetime.date.today())
                 t = st.time_input("時間", datetime.time(10, 0))
                 cap = st.number_input("定員", value=5)
                 com = st.text_input("コメント")
                 if st.form_submit_button("作成", type="primary"):
-                    admin_create_slot(d, t, cap, com); st.rerun()
-            st.divider()
+                    success, msg = admin_create_slot(d, t, cap, com)
+                    if success: st.success(msg); time.sleep(1); st.rerun()
+                    else: st.error(msg)
+            
             st.markdown(f"[スプレッドシートを開く]({st.secrets['spreadsheet_url']})")
