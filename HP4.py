@@ -33,28 +33,61 @@ def get_db_connection():
     return client.open_by_url(sheet_url)
 
 # ==========================================
-# 1. データ管理ロジック (Backend)
+# 1. データ管理ロジック (Backend) - 強力補正版
 # ==========================================
 
+def clean_df(df):
+    """データフレームの列名空白除去・列名統一"""
+    if not df.empty:
+        # 列名の空白削除
+        df.columns = [str(c).strip() for c in df.columns]
+        # 列名の小文字化対応 (No -> no)
+        df.columns = [str(c).lower() for c in df.columns]
+        
+        # 'no' 列を 'appointment_id' に統一 (これで予約ボタンが動くようになります)
+        if 'no' in df.columns and 'appointment_id' not in df.columns:
+            df = df.rename(columns={'no': 'appointment_id'})
+            
+    return df
+
+def normalize_date(date_val):
+    """日付を YYYY-MM-DD に統一する (2025/12/2 -> 2025-12-02)"""
+    s = str(date_val).strip()
+    try:
+        # スラッシュでもハイフンでも日付型に変換してから文字列に戻す
+        return pd.to_datetime(s).strftime('%Y-%m-%d')
+    except:
+        return s
+
+def normalize_time(time_val):
+    """時間を HH:MM に統一する (9:00 -> 09:00)"""
+    s = str(time_val).strip()
+    try:
+        return pd.to_datetime(s, format='%H:%M:%S').strftime('%H:%M')
+    except:
+        try:
+            return pd.to_datetime(s, format='%H:%M').strftime('%H:%M')
+        except:
+            if ':' in s:
+                parts = s.split(':')
+                if len(parts) >= 2:
+                    return f"{int(parts[0]):02}:{int(parts[1]):02}"
+            return s
+
 def load_data():
-    """スケジュールと予約データを読み込む（安全対策版）"""
+    """スケジュールと予約データを読み込む（強力補正版）"""
     try:
         wb = get_db_connection()
         ws_sched = wb.worksheet("schedule")
         ws_book = wb.worksheet("bookings")
         
         # 全データ取得
-        data_sched = ws_sched.get_all_records()
-        data_book = ws_book.get_all_records()
+        df_sched = pd.DataFrame(ws_sched.get_all_records())
+        df_book = pd.DataFrame(ws_book.get_all_records())
         
-        df_sched = pd.DataFrame(data_sched)
-        df_book = pd.DataFrame(data_book)
-        
-        # ★重要: カラム名の空白除去（エラー防止）
-        if not df_sched.empty:
-            df_sched.columns = [str(c).strip() for c in df_sched.columns]
-        if not df_book.empty:
-            df_book.columns = [str(c).strip() for c in df_book.columns]
+        # 列名の掃除 & 統一
+        df_sched = clean_df(df_sched)
+        df_book = clean_df(df_book)
 
     except Exception as e:
         st.error(f"データ読み込みエラー: {e}")
@@ -63,12 +96,16 @@ def load_data():
     appointments = []
     if not df_sched.empty:
         # 必須カラムチェック
-        if 'date' not in df_sched.columns or 'time' not in df_sched.columns or 'id' not in df_sched.columns:
-            st.error("エラー: scheduleシートの見出しが正しくありません (id, date, time が必要)")
+        required = ['id', 'date', 'time']
+        if not all(col in df_sched.columns for col in required):
+            st.error(f"エラー: scheduleシートに必須列 {required} が不足しています。")
             return []
 
-        # 日付・時間順にソート
-        df_sched['date'] = df_sched['date'].astype(str)
+        # ★ 日付と時間の形式を強制統一（これでカレンダーが表示されます）
+        df_sched['date'] = df_sched['date'].apply(normalize_date)
+        df_sched['time'] = df_sched['time'].apply(normalize_time)
+        
+        # ソート
         df_sched = df_sched.sort_values(by=["date", "time"])
 
         for _, row in df_sched.iterrows():
@@ -78,6 +115,7 @@ def load_data():
             members = []
             # 予約データの紐づけ
             if not df_book.empty and 'appointment_id' in df_book.columns:
+                # 文字列にして比較（IDの型ズレ防止）
                 matched = df_book[df_book['appointment_id'].astype(str) == str(appt['id'])]
                 if 'user_name' in matched.columns:
                     members = matched['user_name'].tolist()
@@ -99,10 +137,8 @@ def authenticate_user(user_id, password):
         records = ws_users.get_all_records()
         
         for user in records:
-            # 辞書のキーの空白も削除してアクセス
-            u_data = {k.strip(): v for k, v in user.items()}
-            
-            # 文字列として比較
+            u_data = {str(k).strip().lower(): v for k, v in user.items()}
+            # ID, PASSは文字列化して比較
             if str(u_data.get('user_id', '')) == str(user_id) and str(u_data.get('password', '')) == str(password):
                 return {
                     "user_id": str(u_data.get('user_id')),
@@ -121,12 +157,11 @@ def update_user_profile(user_id, new_email, new_password=None):
         wb = get_db_connection()
         ws_users = wb.worksheet("users")
         cell = ws_users.find(str(user_id), in_column=1)
-        
         if cell:
             row_num = cell.row
-            ws_users.update_cell(row_num, 4, new_email) # Email column
+            ws_users.update_cell(row_num, 4, new_email) # Email
             if new_password and len(new_password) > 0:
-                ws_users.update_cell(row_num, 2, new_password) # Password column
+                ws_users.update_cell(row_num, 2, new_password) # Password
             return True, "情報を更新しました"
         else:
             return False, "ユーザーが見つかりません"
@@ -141,13 +176,12 @@ def add_booking(appt_id, user_name):
         ws_book = wb.worksheet("bookings")
         ws_sched = wb.worksheet("schedule")
         
-        # 最新データを取得
         df_book = pd.DataFrame(ws_book.get_all_records())
         df_sched = pd.DataFrame(ws_sched.get_all_records())
         
-        # カラム掃除
-        if not df_book.empty: df_book.columns = [str(c).strip() for c in df_book.columns]
-        if not df_sched.empty: df_sched.columns = [str(c).strip() for c in df_sched.columns]
+        # 列名補正
+        df_book = clean_df(df_book)
+        df_sched = clean_df(df_sched)
         
         appt_id_str = str(appt_id)
 
@@ -158,9 +192,7 @@ def add_booking(appt_id, user_name):
             if exists: return False, "既に予約済みです"
         
         # 2. 定員チェック
-        if 'id' not in df_sched.columns: return False, "scheduleシートにid列がありません"
         target = df_sched[df_sched['id'].astype(str) == appt_id_str]
-        
         if target.empty: return False, "予約枠が見つかりません"
         
         capacity = int(target.iloc[0]['capacity'])
@@ -172,6 +204,9 @@ def add_booking(appt_id, user_name):
 
         # 3. 書き込み
         now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # append_rowはリストの順序で追加されるため、[ID, 名前, 日時] の順で追加
+        # スプレッドシートの列順が [no, user_name, booked_at] であることを前提とします
         ws_book.append_row([int(appt_id), user_name, now_ts])
         
         return True, "予約しました"
@@ -185,12 +220,14 @@ def remove_booking(appt_id, user_name):
         records = ws_book.get_all_records()
         row_to_delete = None
         
-        # 行特定ロジック
         for i, r in enumerate(records):
-            # キーの空白除去
-            r_clean = {k.strip(): v for k, v in r.items()}
-            if str(r_clean.get('appointment_id')) == str(appt_id) and r_clean.get('user_name') == user_name:
-                row_to_delete = i + 2 # ヘッダー分+1, 0始まり+1
+            r_clean = {str(k).strip().lower(): v for k, v in r.items()}
+            
+            # 列名が appointment_id または no の列を探す
+            rid = r_clean.get('appointment_id') or r_clean.get('no')
+            
+            if str(rid) == str(appt_id) and r_clean.get('user_name') == user_name:
+                row_to_delete = i + 2
                 break
         
         if row_to_delete:
@@ -212,8 +249,8 @@ def admin_create_slot(date_obj, time_obj, capacity, comment):
         if records:
             ids = []
             for r in records:
-                # キーのゆらぎに対応
-                val = r.get('id') or r.get('id ')
+                r_clean = {str(k).strip().lower(): v for k, v in r.items()}
+                val = r_clean.get('id')
                 if str(val).isdigit(): ids.append(int(val))
             if ids: new_id = max(ids) + 1
             
@@ -230,9 +267,17 @@ def admin_delete_slot(slot_id):
         cell = ws_sched.find(str(slot_id))
         if cell: ws_sched.delete_rows(cell.row)
             
-        cell_list = ws_book.findall(str(slot_id))
-        rows = sorted([c.row for c in cell_list if c.col == 1], reverse=True)
-        for r in rows: ws_book.delete_rows(r)
+        # 予約データの削除
+        records = ws_book.get_all_records()
+        rows_to_delete = []
+        for i, r in enumerate(records):
+            r_clean = {str(k).strip().lower(): v for k, v in r.items()}
+            rid = r_clean.get('appointment_id') or r_clean.get('no')
+            if str(rid) == str(slot_id):
+                rows_to_delete.append(i + 2)
+        
+        for r in sorted(rows_to_delete, reverse=True):
+            ws_book.delete_rows(r)
         return True, "削除しました"
     except Exception as e: return False, str(e)
 
@@ -254,8 +299,9 @@ st.markdown("""
 if "logged_in" not in st.session_state: st.session_state.logged_in = False
 if "user_info" not in st.session_state: st.session_state.user_info = {}
 
-if "view_year" not in st.session_state: st.session_state.view_year = datetime.date.today().year
-if "view_month" not in st.session_state: st.session_state.view_month = datetime.date.today().month
+# 初期表示年月
+if "view_year" not in st.session_state: st.session_state.view_year = 2025
+if "view_month" not in st.session_state: st.session_state.view_month = 12
 
 def change_month(v):
     st.session_state.view_month += v
@@ -361,15 +407,10 @@ else:
                                             if success: st.success(msg); time.sleep(1); st.rerun()
                                             else: st.error(msg)
                                     elif not is_full:
-                                        # ★ ここが修正ポイント：成功した時だけリロード
                                         if st.button("予約する", key=f"r_{app['id']}", type="primary"):
                                             success, msg = add_booking(app['id'], user_info['name'])
-                                            if success:
-                                                st.success(msg)
-                                                time.sleep(1) # メッセージを見せるため待機
-                                                st.rerun()
-                                            else:
-                                                st.error(msg) # エラーならリロードせず表示
+                                            if success: st.success(msg); time.sleep(1); st.rerun()
+                                            else: st.error(msg)
                                     else:
                                         st.error("満席")
 
@@ -379,7 +420,7 @@ else:
         sorted_apps = sorted(appointments_data, key=lambda x: (x['date'], x['time']))
         if not is_admin and st.toggle("自分の予約のみ", False):
             sorted_apps = [a for a in sorted_apps if user_info['name'] in a["members"]]
-            
+        
         for app in sorted_apps:
             with st.container(border=True):
                 c1, c2, c3 = st.columns([2, 4, 2])
@@ -436,7 +477,7 @@ else:
         with tabs[3]:
             st.header("🔧 管理者ダッシュボード")
             
-            # 診断モード追加
+            # 診断モード
             st.subheader("🔍 データ状態の確認 (デバッグ)")
             if st.button("最新データを読み込む"): st.rerun()
             
@@ -452,8 +493,6 @@ else:
                 with c2:
                     st.write("Bookings Columns:", list(df_b.columns) if not df_b.empty else "Empty")
                     st.dataframe(df_b.head(3))
-                    if not df_b.empty and 'appointment_id' not in [str(c).strip() for c in df_b.columns]:
-                         st.error("⚠️ bookingsシートに 'appointment_id' 列がありません。列名を確認してください。")
 
             except Exception as e:
                 st.error(f"データ取得エラー: {e}")
