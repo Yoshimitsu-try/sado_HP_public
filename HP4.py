@@ -39,29 +39,36 @@ def get_db_connection():
 def clean_df(df):
     """データフレームの列名空白除去・列名統一"""
     if not df.empty:
-        # 列名の空白削除
-        df.columns = [str(c).strip() for c in df.columns]
-        # 列名の小文字化対応 (No -> no)
-        df.columns = [str(c).lower() for c in df.columns]
+        # 列名の空白削除 & 小文字化
+        df.columns = [str(c).strip().lower() for c in df.columns]
         
-        # 'no' 列を 'appointment_id' に統一 (これで予約ボタンが動くようになります)
+        # 'no' 列を 'appointment_id' に統一 (これで予約データが紐づきます)
         if 'no' in df.columns and 'appointment_id' not in df.columns:
             df = df.rename(columns={'no': 'appointment_id'})
             
     return df
 
 def normalize_date(date_val):
-    """日付を YYYY-MM-DD に統一する (2025/12/2 -> 2025-12-02)"""
+    """日付を YYYY-MM-DD に強制統一する"""
+    if pd.isna(date_val): return ""
     s = str(date_val).strip()
+    
+    # スラッシュをハイフンに置換 (2025/12/2 -> 2025-12-2)
+    s = s.replace('/', '-')
+    
     try:
-        # スラッシュでもハイフンでも日付型に変換してから文字列に戻す
+        # pandasで日付型にしてフォーマット統一 (2025-12-2 -> 2025-12-02)
         return pd.to_datetime(s).strftime('%Y-%m-%d')
     except:
         return s
 
 def normalize_time(time_val):
-    """時間を HH:MM に統一する (9:00 -> 09:00)"""
+    """時間を HH:MM に強制統一する"""
     s = str(time_val).strip()
+    if not s: return ""
+    # 全角コロン対応
+    s = s.replace('：', ':')
+    
     try:
         return pd.to_datetime(s, format='%H:%M:%S').strftime('%H:%M')
     except:
@@ -74,8 +81,12 @@ def normalize_time(time_val):
                     return f"{int(parts[0]):02}:{int(parts[1]):02}"
             return s
 
+def normalize_name(name):
+    """名前のスペースを無視して比較するための関数"""
+    return str(name).replace(" ", "").replace("　", "").strip()
+
 def load_data():
-    """スケジュールと予約データを読み込む（強力補正版）"""
+    """スケジュールと予約データを読み込む"""
     try:
         wb = get_db_connection()
         ws_sched = wb.worksheet("schedule")
@@ -85,7 +96,7 @@ def load_data():
         df_sched = pd.DataFrame(ws_sched.get_all_records())
         df_book = pd.DataFrame(ws_book.get_all_records())
         
-        # 列名の掃除 & 統一
+        # ★列名の掃除 & 統一 (no -> appointment_id)
         df_sched = clean_df(df_sched)
         df_book = clean_df(df_book)
 
@@ -96,21 +107,26 @@ def load_data():
     appointments = []
     if not df_sched.empty:
         # 必須カラムチェック
-        required = ['id', 'date', 'time']
-        if not all(col in df_sched.columns for col in required):
-            st.error(f"エラー: scheduleシートに必須列 {required} が不足しています。")
+        if 'id' not in df_sched.columns:
+            st.error("エラー: scheduleシートに 'id' 列がありません")
             return []
 
-        # ★ 日付と時間の形式を強制統一（これでカレンダーが表示されます）
-        df_sched['date'] = df_sched['date'].apply(normalize_date)
-        df_sched['time'] = df_sched['time'].apply(normalize_time)
+        # ★日付と時間の形式を強制統一（これでカレンダーが表示されます）
+        if 'date' in df_sched.columns:
+            df_sched['date'] = df_sched['date'].apply(normalize_date)
+        if 'time' in df_sched.columns:
+            df_sched['time'] = df_sched['time'].apply(normalize_time)
         
         # ソート
-        df_sched = df_sched.sort_values(by=["date", "time"])
+        if 'date' in df_sched.columns and 'time' in df_sched.columns:
+            df_sched = df_sched.sort_values(by=["date", "time"])
 
         for _, row in df_sched.iterrows():
             appt = row.to_dict()
-            appt['id'] = int(appt['id'])
+            try:
+                appt['id'] = int(appt['id'])
+            except:
+                continue
             
             members = []
             # 予約データの紐づけ
@@ -138,7 +154,7 @@ def authenticate_user(user_id, password):
         
         for user in records:
             u_data = {str(k).strip().lower(): v for k, v in user.items()}
-            # ID, PASSは文字列化して比較
+            
             if str(u_data.get('user_id', '')) == str(user_id) and str(u_data.get('password', '')) == str(password):
                 return {
                     "user_id": str(u_data.get('user_id')),
@@ -185,11 +201,13 @@ def add_booking(appt_id, user_name):
         
         appt_id_str = str(appt_id)
 
-        # 1. 重複チェック
+        # 1. 重複チェック (名前のスペースを無視して比較)
         if not df_book.empty and 'appointment_id' in df_book.columns:
-            exists = ((df_book['appointment_id'].astype(str) == appt_id_str) & 
-                      (df_book['user_name'] == user_name)).any()
-            if exists: return False, "既に予約済みです"
+            current_users = df_book[df_book['appointment_id'].astype(str) == appt_id_str]['user_name'].tolist()
+            # 正規化して比較
+            norm_name = normalize_name(user_name)
+            if any(normalize_name(u) == norm_name for u in current_users):
+                return False, "既に予約済みです"
         
         # 2. 定員チェック
         target = df_sched[df_sched['id'].astype(str) == appt_id_str]
@@ -204,9 +222,6 @@ def add_booking(appt_id, user_name):
 
         # 3. 書き込み
         now_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        
-        # append_rowはリストの順序で追加されるため、[ID, 名前, 日時] の順で追加
-        # スプレッドシートの列順が [no, user_name, booked_at] であることを前提とします
         ws_book.append_row([int(appt_id), user_name, now_ts])
         
         return True, "予約しました"
@@ -220,13 +235,16 @@ def remove_booking(appt_id, user_name):
         records = ws_book.get_all_records()
         row_to_delete = None
         
+        norm_name = normalize_name(user_name)
+        
         for i, r in enumerate(records):
             r_clean = {str(k).strip().lower(): v for k, v in r.items()}
-            
-            # 列名が appointment_id または no の列を探す
+            # 列名ゆらぎ対応
             rid = r_clean.get('appointment_id') or r_clean.get('no')
+            r_name = r_clean.get('user_name')
             
-            if str(rid) == str(appt_id) and r_clean.get('user_name') == user_name:
+            # ID一致 かつ 名前一致(スペース無視)
+            if str(rid) == str(appt_id) and normalize_name(r_name) == norm_name:
                 row_to_delete = i + 2
                 break
         
@@ -384,8 +402,12 @@ else:
                         if not day_apps: st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
                         
                         for app in day_apps:
-                            is_mine = user_info['name'] in app['members']
+                            # 判定強化（スペース無視）
+                            norm_my_name = normalize_name(user_info['name'])
+                            app_members_norm = [normalize_name(m) for m in app['members']]
+                            is_mine = norm_my_name in app_members_norm
                             is_full = len(app['members']) >= app['capacity']
+                            
                             label = f"🍵 {app['time']}" if is_mine else (f"🈵 {app['time']}" if is_full else app['time'])
                             
                             with st.popover(label, use_container_width=True):
@@ -418,8 +440,15 @@ else:
     with tabs[1]:
         st.info("お稽古日程一覧")
         sorted_apps = sorted(appointments_data, key=lambda x: (x['date'], x['time']))
+        
+        # 自分の予約のみフィルター（判定強化）
         if not is_admin and st.toggle("自分の予約のみ", False):
-            sorted_apps = [a for a in sorted_apps if user_info['name'] in a["members"]]
+            norm_my_name = normalize_name(user_info['name'])
+            filtered = []
+            for a in sorted_apps:
+                if norm_my_name in [normalize_name(m) for m in a['members']]:
+                    filtered.append(a)
+            sorted_apps = filtered
         
         for app in sorted_apps:
             with st.container(border=True):
@@ -435,7 +464,10 @@ else:
                              if success: st.success(msg); time.sleep(1); st.rerun()
                              else: st.error(msg)
                     else:
-                        is_mine = user_info['name'] in app['members']
+                        norm_my_name = normalize_name(user_info['name'])
+                        app_members_norm = [normalize_name(m) for m in app['members']]
+                        is_mine = norm_my_name in app_members_norm
+                        
                         if is_mine:
                             if st.button("取消", key=f"lst_c_{app['id']}", use_container_width=True):
                                 success, msg = remove_booking(app['id'], user_info['name'])
